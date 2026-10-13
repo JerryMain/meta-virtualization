@@ -10,6 +10,7 @@ These tests verify vpdmn functionality including:
 - Container execution (vrun)
 - System commands (system df, system prune)
 - Storage management (vstorage list, path, df, clean)
+- Copying between containers and the host (cp)
 
 Tests use a separate state directory (~/.vpdmn-test/) to avoid
 interfering with user's images in ~/.vpdmn/.
@@ -739,3 +740,149 @@ class TestRemoteFetchAndCrossInstall:
 
         result = vpdmn.vrun("alpine:latest", "/bin/echo", "alpine_ok")
         assert "alpine_ok" in result.stdout
+
+
+def assert_cp_dir_copy(path):
+    """Check a copy of the cp test container's /cpdata at path."""
+    script = path / "bin" / "hello.sh"
+    assert "Hello from the container!" in script.read_text()
+    assert script.stat().st_mode & 0o100, "exec bit lost"
+    assert script.stat().st_uid == os.getuid()
+    assert (path / ".hidden").read_text() == "Hidden file\n"
+    assert os.readlink(path / "link") == "bin/hello.sh"
+
+
+@pytest.mark.memres
+class TestCp:
+    """Test cp between containers and the host.
+
+    Copies to the host follow the docker/podman cp destination rules and are
+    owned by the host user.
+    """
+
+    @pytest.fixture(scope="class")
+    def cp_container(self, vpdmn_memres_session, tmp_path_factory):
+        """Running container with /cpdata copied in from the host.
+
+        Class-scoped so the container is started once for all cp tests.
+        """
+        vpdmn = vpdmn_memres_session
+        vpdmn.ensure_alpine()
+        vpdmn.run("rm", "-f", "cp-test", check=False)
+        vpdmn.run("run", "-d", "--name", "cp-test", "alpine:latest", "sleep", "3600",
+                  timeout=60)
+        try:
+            cpdata = tmp_path_factory.mktemp("cp") / "cpdata"
+            (cpdata / "bin").mkdir(parents=True)
+            script = cpdata / "bin" / "hello.sh"
+            script.write_text("#!/bin/sh\necho 'Hello from the container!'\n")
+            script.chmod(0o755)
+            (cpdata / ".hidden").write_text("Hidden file\n")
+            (cpdata / "link").symlink_to("bin/hello.sh")
+            vpdmn.run("cp", str(cpdata), "cp-test:/", timeout=60)
+            yield vpdmn
+        finally:
+            vpdmn.run("rm", "-f", "cp-test", check=False)
+
+    def test_cp_host_to_container(self, cp_container):
+        """Test copying a directory from the host into a container."""
+        vpdmn = cp_container
+        result = vpdmn.run("exec", "cp-test", "cat", "/cpdata/.hidden", timeout=60)
+        assert result.returncode == 0
+        assert "Hidden file" in result.stdout
+
+    def test_cp_file_into_dir(self, cp_container, temp_dir):
+        """Test copying a file into an existing directory."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/bin/hello.sh", str(temp_dir), timeout=60)
+        assert result.returncode == 0
+        copy = temp_dir / "hello.sh"
+        assert "Hello from the container!" in copy.read_text()
+        assert copy.stat().st_uid == os.getuid()
+
+    def test_cp_file_to_new_name(self, cp_container, temp_dir):
+        """Test copying a file to a path that doesn't exist."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/bin/hello.sh", str(temp_dir / "renamed.sh"),
+                           timeout=60)
+        assert result.returncode == 0
+        assert "Hello from the container!" in (temp_dir / "renamed.sh").read_text()
+
+    def test_cp_file_over_file(self, cp_container, temp_dir):
+        """Test copying a file over an existing file."""
+        vpdmn = cp_container
+        existing = temp_dir / "existing.sh"
+        existing.write_text("Old content\n")
+        result = vpdmn.run("cp", "cp-test:/cpdata/bin/hello.sh", str(existing), timeout=60)
+        assert result.returncode == 0
+        assert "Hello from the container!" in existing.read_text()
+
+    def test_cp_dotfile(self, cp_container, temp_dir):
+        """Test copying a file whose name starts with a dot."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/.hidden", str(temp_dir), timeout=60)
+        assert result.returncode == 0
+        assert (temp_dir / ".hidden").read_text() == "Hidden file\n"
+
+    def test_cp_dir_into_dir(self, cp_container, temp_dir):
+        """Test copying a directory into an existing directory."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata", str(temp_dir), timeout=60)
+        assert result.returncode == 0
+        assert_cp_dir_copy(temp_dir / "cpdata")
+
+    def test_cp_dir_to_new_name(self, cp_container, temp_dir):
+        """Test copying a directory to a path that doesn't exist."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata", str(temp_dir / "newdir"), timeout=60)
+        assert result.returncode == 0
+        assert_cp_dir_copy(temp_dir / "newdir")
+
+    def test_cp_dir_contents_into_dir(self, cp_container, temp_dir):
+        """Test copying a directory's contents (/.) into an existing directory."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/.", str(temp_dir), timeout=60)
+        assert result.returncode == 0
+        assert_cp_dir_copy(temp_dir)
+        assert not (temp_dir / "cpdata").exists()
+
+    def test_cp_dir_contents_to_new_name(self, cp_container, temp_dir):
+        """Test copying a directory's contents (/.) to a path that doesn't exist."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/.", str(temp_dir / "newdir"), timeout=60)
+        assert result.returncode == 0
+        assert_cp_dir_copy(temp_dir / "newdir")
+
+    def test_cp_missing_source_fails(self, cp_container, temp_dir):
+        """Test that copying a path that doesn't exist fails."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/nonexistent", str(temp_dir),
+                           check=False, timeout=60)
+        assert result.returncode != 0
+        assert list(temp_dir.iterdir()) == []
+
+    def test_cp_missing_parent_fails(self, cp_container, temp_dir):
+        """Test that copying to a path whose parent doesn't exist fails."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/bin/hello.sh",
+                           str(temp_dir / "missing" / "hello.sh"), check=False, timeout=60)
+        assert result.returncode != 0
+        assert list(temp_dir.iterdir()) == []
+
+    def test_cp_file_to_missing_dir_fails(self, cp_container, temp_dir):
+        """Test that copying a file to a missing path ending in / fails."""
+        vpdmn = cp_container
+        result = vpdmn.run("cp", "cp-test:/cpdata/bin/hello.sh", f"{temp_dir}/newdir/",
+                           check=False, timeout=60)
+        assert result.returncode != 0
+        assert list(temp_dir.iterdir()) == []
+
+    def test_cp_dir_over_file_fails(self, cp_container, temp_dir):
+        """Test that copying a directory over an existing file fails."""
+        vpdmn = cp_container
+        existing = temp_dir / "existing"
+        existing.write_text("Old content\n")
+        result = vpdmn.run("cp", "cp-test:/cpdata", str(existing), check=False, timeout=60)
+        assert result.returncode != 0
+        assert existing.read_text() == "Old content\n"
+        assert list(temp_dir.iterdir()) == [existing]

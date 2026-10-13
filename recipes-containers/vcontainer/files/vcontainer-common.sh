@@ -2818,18 +2818,41 @@ case "$COMMAND" in
         # Determine direction: host->container or container->host
         if [[ "$SRC" == *":"* ]] && [[ "$DEST" != *":"* ]]; then
             # Container to host: runtime cp container:/path /local/path
-            # Run runtime cp to /mnt/share, then copy from share to host
+            # Let the runtime write a tar stream and unpack it here: podman can't
+            # chown files in the share, which is exported with security_model=none
             CONTAINER_PATH="$SRC"
             HOST_PATH="$DEST"
             SHARE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
 
+            # The runtimes lay out a /. source differently in the tar stream
+            CP_STRIP=""
+            if [[ "$CONTAINER_PATH" == */. ]]; then
+                CONTAINER_PATH="${CONTAINER_PATH%.}"
+                CP_STRIP="--strip-components=1"
+            fi
+
             if daemon_is_running; then
                 rm -rf "$SHARE_DIR"/* 2>/dev/null || true
-                run_runtime_command "$VCONTAINER_RUNTIME_CMD cp $CONTAINER_PATH /mnt/share/"
-                # Find what was copied and move to destination
-                if [ -n "$(ls -A "$SHARE_DIR" 2>/dev/null)" ]; then
-                    cp -r "$SHARE_DIR"/* "$HOST_PATH" 2>/dev/null || cp -r "$SHARE_DIR"/* "$(dirname "$HOST_PATH")/"
-                    rm -rf "$SHARE_DIR"/*
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD cp $CONTAINER_PATH - > /mnt/share/cp.tar"
+                if [ -s "$SHARE_DIR/cp.tar" ]; then
+                    trap 'rm -rf "$SHARE_DIR/cp.tar" "$CP_DIR"' EXIT
+                    if [ -d "$HOST_PATH" ]; then
+                        if ! tar -xf "$SHARE_DIR/cp.tar" -C "$HOST_PATH" $CP_STRIP; then
+                            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Copy failed - could not unpack into $HOST_PATH" >&2
+                            exit 1
+                        fi
+                    elif [ ! -d "$(dirname "$HOST_PATH")" ]; then
+                        # docker/podman cp require the parent to exist
+                        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Copy failed - $(dirname "$HOST_PATH") does not exist" >&2
+                        exit 1
+                    else
+                        CP_DIR=$(mktemp -d "$(dirname "$HOST_PATH")/.$VCONTAINER_RUNTIME_NAME-cp.XXXXXX")
+                        tar -xf "$SHARE_DIR/cp.tar" -C "$CP_DIR"
+                        if ! mv "$(find "$CP_DIR" -mindepth 1 -maxdepth 1)" "$HOST_PATH"; then
+                            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Copy failed - could not move to $HOST_PATH" >&2
+                            exit 1
+                        fi
+                    fi
                     echo -e "${GREEN}[$VCONTAINER_RUNTIME_NAME]${NC} Copied to $HOST_PATH"
                 else
                     echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Copy failed - no files in share directory" >&2

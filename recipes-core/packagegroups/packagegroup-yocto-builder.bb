@@ -91,7 +91,7 @@ RDEPENDS:packagegroup-yocto-builder-toolchain = "\
     ${@bb.utils.contains('TCLIBC', 'glibc', 'glibc-dev', '', d)} \
     libgcc-dev \
     libatomic-dev \
-    libgomp \
+    libgomp-dev \
     libxcrypt-dev \
 "
 

@@ -92,6 +92,7 @@ RDEPENDS:packagegroup-yocto-builder-toolchain = "\
     libgcc-dev \
     libatomic-dev \
     libgomp \
+    libxcrypt-dev \
 "
 
 # Layer 3: Yocto-specific tools + utilities
